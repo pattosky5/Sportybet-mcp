@@ -253,8 +253,8 @@ export async function sportybetBookBet(
   }
 
   const booking = await client.createBooking(args.selections);
-  const legOdds = (booking.legs ?? [])
-    .map((l) => Number((l as Record<string, unknown>).odds ?? (l as Record<string, unknown>).currentOdds ?? 0))
+  const legOdds = booking.legs
+    .map((l) => Number((l as unknown as Record<string, unknown>).odds ?? (l as unknown as Record<string, unknown>).currentOdds ?? 0))
     .filter((n) => Number.isFinite(n) && n > 0);
   const combinedOdds = legOdds.length ? calcCombinedOdds(legOdds) : null;
 
@@ -262,7 +262,7 @@ export async function sportybetBookBet(
     success: true,
     bookingCode: booking.shareCode,
     shareURL: booking.shareURL,
-    expiresAt: booking.deadlineMs ?? null,
+    expiresAt: booking.deadlineMs ? new Date(booking.deadlineMs).toISOString() : null,
     combinedOdds,
     legs: booking.legs,
     unavailableOutcomes: booking.unavailableOutcomes,
@@ -285,7 +285,7 @@ export async function sportybetGetBookingStatus(
     success: true,
     bookingCode: booking.shareCode,
     shareURL: booking.shareURL,
-    expiresAt: booking.deadlineMs ?? null,
+    expiresAt: booking.deadlineMs ? new Date(booking.deadlineMs).toISOString() : null,
     legs: booking.legs,
     unavailableOutcomes: booking.unavailableOutcomes,
   };
