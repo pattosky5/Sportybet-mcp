@@ -253,14 +253,16 @@ export async function sportybetBookBet(
   }
 
   const booking = await client.createBooking(args.selections);
-  const legOdds = booking.legs.map((o) => o.odds).filter((n) => Number.isFinite(n) && n > 0);
+  const legOdds = (booking.legs ?? [])
+    .map((l) => Number((l as Record<string, unknown>).odds ?? (l as Record<string, unknown>).currentOdds ?? 0))
+    .filter((n) => Number.isFinite(n) && n > 0);
   const combinedOdds = legOdds.length ? calcCombinedOdds(legOdds) : null;
 
   const result = {
     success: true,
     bookingCode: booking.shareCode,
     shareURL: booking.shareURL,
-    expiresAt: booking.deadlineMs ? new Date(booking.deadlineMs).toISOString() : null,
+    expiresAt: booking.deadlineMs ?? null,
     combinedOdds,
     legs: booking.legs,
     unavailableOutcomes: booking.unavailableOutcomes,
@@ -283,11 +285,10 @@ export async function sportybetGetBookingStatus(
     success: true,
     bookingCode: booking.shareCode,
     shareURL: booking.shareURL,
-    expiresAt: booking.deadlineMs ? new Date(booking.deadlineMs).toISOString() : null,
+    expiresAt: booking.deadlineMs ?? null,
     legs: booking.legs,
     unavailableOutcomes: booking.unavailableOutcomes,
   };
   logger.info({ tool: "sportybet_get_booking_status", success: true, bookingCode: code });
   return ok(result);
-            }
-    
+}
