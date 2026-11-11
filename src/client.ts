@@ -239,7 +239,8 @@ export class SportyBetClient {
       const biz = this.bizError(raw);
       if (biz) throw biz;
 
-      const batch = flattenFixtures(raw);
+      const tournaments = raw?.data?.tournaments ?? [];
+      const batch = flattenFixtures(tournaments);
       collected.push(...batch);
 
       const total = Number(raw?.data?.totalNum ?? 0);
@@ -291,7 +292,7 @@ export class SportyBetClient {
     const biz = this.bizError(raw);
     if (biz) throw biz;
 
-    const booking = normalizeBooking(raw);
+    const booking = normalizeBooking(raw?.data ?? {});
     if (!booking.shareCode) {
       throw new SportyBetError(
         "NO_BOOKING_CODE",
@@ -310,6 +311,6 @@ export class SportyBetClient {
     });
     const biz = this.bizError(raw);
     if (biz) throw biz;
-    return normalizeBooking(raw);
+    return normalizeBooking(raw?.data ?? {});
   }
 }
