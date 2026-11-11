@@ -1,14 +1,4 @@
-/**
- * SportyBet MCP Server — entry point.
- *
- * Exposes SportyBet football fixtures, markets, odds, combined-odds math,
- * and NON-STAKING booking-code preparation to AI agents over MCP stdio.
- *
- * Safety boundary: this server can ONLY prepare betslips and create shareable
- * booking codes. It has no code path that places, submits, or stakes a wager,
- * and it never requests credentials.
- * Yup
- */
+#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -16,6 +6,7 @@ import { loadConfig } from "./config.js";
 import { SportyBetClient, SportyBetError } from "./client.js";
 import { logger } from "./logger.js";
 import {
+  fail,
   sportybetBookBet,
   sportybetCalculateCombinedOdds,
   sportybetGetBookingStatus,
@@ -23,178 +14,171 @@ import {
   sportybetGetMarkets,
   sportybetGetOdds,
   sportybetSearchFixtures,
-  type ToolResult,
 } from "./tools.js";
 
-const config = loadConfig();
-const client = new SportyBetClient(config);
+const cfg = loadConfig();
+const client = new SportyBetClient(cfg);
 
 const server = new McpServer({
-  name: "sportybet",
-  version: "1.0.0",
+  name: "sportybet-mcp",
+  version: "1.1.0",
 });
 
-type ToolFn = (args: any, requestId: string) => Promise<ToolResult> | ToolResult;
+const sportSchema = z
+  .string()
+  .optional()
+  .describe(
+    'Sport to query: "football", "basketball", "tennis", "ice_hockey", "handball", "table_tennis", "volleyball", "all" (fetches Football, Basketball & Tennis together), or a raw Betradar ID like "sr:sport:2".',
+  );
 
-function wrap(toolName: string, fn: ToolFn) {
-  return async (args: Record<string, unknown>): Promise<ToolResult> => {
-    const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const started = Date.now();
-    try {
-      const result = await fn(args, requestId);
-      logger.info({
-        tool: toolName,
-        requestId,
-        success: !result.isError,
-        latencyMs: Date.now() - started,
-      });
-      return result;
-    } catch (err) {
-      const latencyMs = Date.now() - started;
-      if (err instanceof SportyBetError) {
-        logger.error({ tool: toolName, requestId, success: false, latencyMs, errorCode: err.code });
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { success: false, error: { code: err.code, message: err.message, action: err.action } },
-                null,
-                2,
-              ),
-            },
-          ],
-          isError: true,
-        };
-      }
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error({ tool: toolName, requestId, success: false, latencyMs, errorCode: "INTERNAL", message });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              { success: false, error: { code: "INTERNAL", message, action: "Retry the request." } },
-              null,
-              2,
-            ),
-          },
-        ],
-        isError: true,
-      };
-    }
-  };
+function wrapError(toolName: string, err: unknown) {
+  if (err instanceof SportyBetError) {
+    logger.warn({ tool: toolName, code: err.code, message: err.message });
+    return fail(err.code, err.message, err.action);
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  logger.error({ tool: toolName, message: msg });
+  return fail("INTERNAL_ERROR", msg, "Check server logs and try again.");
 }
 
-const NO_STAKE = " This tool NEVER places, submits, or stakes a wager.";
-
-server.registerTool(
+server.tool(
   "sportybet_get_fixtures",
+  "Fetch upcoming SportyBet fixtures across any sport (Football, Basketball, Tennis, Ice Hockey, Handball, Table Tennis, Volleyball, or all).",
   {
-    title: "Get upcoming SportyBet football fixtures",
-    description:
-      "Retrieve upcoming football fixtures from SportyBet (Nigeria region). Optionally filter by date (YYYY-MM-DD, West Africa Time) and/or league. Returns eventId, league, teams, start time and status — no raw API data. Odds are fetched separately with sportybet_get_markets.",
-    inputSchema: {
-      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Local date YYYY-MM-DD to filter fixtures (WAT). Omit for all upcoming."),
-      league: z.string().optional().describe("League or country name substring, e.g. 'Premier League' or 'England'."),
-      limit: z.number().int().min(1).max(500).default(50).describe("Maximum number of fixtures to return."),
-    },
+    sport: sportSchema,
+    date: z.string().optional().describe("Filter by date in YYYY-MM-DD format (WAT / UTC+1)."),
+    league: z.string().optional().describe("Filter by league, tournament, or country name."),
+    limit: z.number().int().min(1).max(500).optional().describe("Max fixtures to return (default 50)."),
   },
-  wrap("sportybet_get_fixtures", (args) => sportybetGetFixtures(client, args, config.tzOffsetMinutes)),
+  async (args) => {
+    try {
+      return await sportybetGetFixtures(client, args, cfg.tzOffsetMinutes);
+    } catch (err) {
+      return wrapError("sportybet_get_fixtures", err);
+    }
+  },
 );
 
-server.registerTool(
+server.tool(
   "sportybet_get_markets",
+  "Get all available betting markets, specifiers, outcomes, and live odds for a specific SportyBet event ID.",
   {
-    title: "Get markets and odds for a SportyBet event",
-    description:
-      "Retrieve all available betting markets and outcomes for a specific SportyBet eventId (from sportybet_get_fixtures). Returns marketId, marketName, specifier, outcomeId, outcomeName and current odds — the exact IDs required to build a booking code." + NO_STAKE,
-    inputSchema: {
-      eventId: z.string().min(1).describe("SportyBet eventId, e.g. 'sr:match:67015328'."),
-    },
+    eventId: z.string().min(1).describe('SportyBet event ID (e.g., "sr:match:67015328").'),
+    sport: sportSchema,
   },
-  wrap("sportybet_get_markets", (args) => sportybetGetMarkets(client, args)),
+  async (args) => {
+    try {
+      return await sportybetGetMarkets(client, args);
+    } catch (err) {
+      return wrapError("sportybet_get_markets", err);
+    }
+  },
 );
 
-server.registerTool(
+server.tool(
   "sportybet_get_odds",
+  "Fetch timestamped odds lines across one or more SportyBet event IDs.",
   {
-    title: "Get current odds for one, or more events",
-    description:
-      "Return normalized current odds (event, market, outcome, odds, eventId, marketId, outcomeId) for up to 50 events, each line stamped with a fetch timestamp. Odds change frequently — treat every value as a snapshot." + NO_STAKE,
-    inputSchema: {
-      eventIds: z.array(z.string().min(1)).min(1).max(50).describe("List of SportyBet eventIds."),
-    },
+    eventIds: z.array(z.string().min(1)).min(1).max(50).describe("List of SportyBet event IDs."),
+    sport: sportSchema,
   },
-  wrap("sportybet_get_odds", (args) => sportybetGetOdds(client, args)),
+  async (args) => {
+    try {
+      return await sportybetGetOdds(client, args);
+    } catch (err) {
+      return wrapError("sportybet_get_odds", err);
+    }
+  },
 );
 
-server.registerTool(
+server.tool(
   "sportybet_search_fixtures",
+  "Search upcoming SportyBet events by team name, player name, league, or country across all sports.",
   {
-    title: "Search SportyBet fixtures",
-    description:
-      "Search upcoming SportyBet football fixtures by team, league, or country name substring, optionally restricted to a date (YYYY-MM-DD, WAT). Returns matching fixtures with eventIds." + NO_STAKE,
-    inputSchema: {
-      query: z.string().min(1).describe("Search text: team name, league, or country."),
-      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Local date YYYY-MM-DD (WAT)."),
-      limit: z.number().int().min(1).max(500).default(50).describe("Maximum number of matches to return."),
-    },
+    query: z.string().min(1).describe("Team, player, league, or country name to search."),
+    sport: sportSchema,
+    date: z.string().optional().describe("Optional YYYY-MM-DD filter (WAT / UTC+1)."),
+    limit: z.number().int().min(1).max(500).optional().describe("Max matches to return (default 50)."),
   },
-  wrap("sportybet_search_fixtures", (args) => sportybetSearchFixtures(client, args, config.tzOffsetMinutes)),
+  async (args) => {
+    try {
+      return await sportybetSearchFixtures(client, args, cfg.tzOffsetMinutes);
+    } catch (err) {
+      return wrapError("sportybet_search_fixtures", err);
+    }
+  },
 );
 
-server.registerTool(
+server.tool(
   "sportybet_calculate_combined_odds",
+  "Multiply decimal odds across selections to calculate combined accumulator odds (pure math, no prediction).",
   {
-    title: "Calculate combined odds",
-    description:
-      "Pure mathematics: multiply decimal odds of selected outcomes into a combined price. Returns combinedOdds and selectionCount. This is NOT a probability estimate and guarantees nothing about any payout." + NO_STAKE,
-    inputSchema: {
-      selections: z.array(z.object({ odds: z.number().positive() })).min(1).max(20).describe("The decimal odds of each selection."),
-    },
+    selections: z
+      .array(
+        z.object({
+          odds: z.number().positive().describe("Decimal odds for this leg."),
+        }),
+      )
+      .min(1)
+      .max(50),
   },
-  wrap("sportybet_calculate_combined_odds", (args) => sportybetCalculateCombinedOdds(args)),
+  async (args) => {
+    try {
+      return sportybetCalculateCombinedOdds(args);
+    } catch (err) {
+      return wrapError("sportybet_calculate_combined_odds", err);
+    }
+  },
 );
 
-server.registerTool(
+server.tool(
   "sportybet_book_bet",
+  "Validate live selections across any sport and generate a real, non-staking SportyBet booking code.",
   {
-    title: "Prepare a SportyBet betslip and create a booking code",
-    description:
-      "Validate every selection against live SportyBet data (event exists, not started, market exists, outcome active, specifier correct), then create a shareable SportyBet booking code. The SportyBet share endpoint is anonymous and NON-STAKING: it returns a booking code but does not place, submit, or stake any wager. If any validation fails, no booking is created. Never returns a fabricated code — only codes actually returned by SportyBet.",
-    inputSchema: {
-      selections: z
-        .array(
-          z.object({
-            eventId: z.string().min(1),
-            marketId: z.string().min(1).describe("Market id, e.g. '1' for 1X2, '18' for Over/Under."),
-            outcomeId: z.string().min(1).describe("Outcome id, e.g. '1' Home, '2' Draw, '3' Away for 1X2."),
-            specifier: z.string().nullish().describe("Market specifier, e.g. 'total=2.5'. Optional for 1X2."),
-            odds: z.number().positive().optional().describe("Odds observed when selecting; used to detect price movement."),
-          }),
-        )
-        .min(1)
-        .max(20),
-    },
+    selections: z
+      .array(
+        z.object({
+          eventId: z.string().min(1),
+          marketId: z.string().min(1),
+          outcomeId: z.string().min(1),
+          specifier: z.string().nullable().optional(),
+          odds: z.number().positive().optional(),
+        }),
+      )
+      .min(1)
+      .max(40),
   },
-  wrap("sportybet_book_bet", (args) => sportybetBookBet(client, args)),
+  async (args) => {
+    try {
+      return await sportybetBookBet(client, args);
+    } catch (err) {
+      return wrapError("sportybet_book_bet", err);
+    }
+  },
 );
 
-server.registerTool(
+server.tool(
   "sportybet_get_booking_status",
+  "Read legs, live odds, and expiry details for an existing SportyBet booking code (read-only).",
   {
-    title: "Check a SportyBet booking code",
-    description:
-      "Read information about an existing SportyBet booking code: fixtures, markets, outcomes, odds and expiry. Read-only — it does not place, modify, or stake any wager." + NO_STAKE,
-    inputSchema: {
-      bookingCode: z.string().min(4).max(12).describe("SportyBet booking code, e.g. 'HW8EM8'."),
-    },
+    bookingCode: z.string().min(1).describe("SportyBet booking / share code."),
   },
-  wrap("sportybet_get_booking_status", (args) => sportybetGetBookingStatus(client, args)),
+  async (args) => {
+    try {
+      return await sportybetGetBookingStatus(client, args);
+    } catch (err) {
+      return wrapError("sportybet_get_booking_status", err);
+    }
+  },
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  logger.info({ message: "SportyBet multi-sport MCP server running on stdio" });
+}
 
-logger.info({ message: `sportybet-mcp ready (region=${config.region})` });
+main().catch((err) => {
+  logger.error({ message: "Fatal startup error", error: String(err) });
+  process.exit(1);
+});
