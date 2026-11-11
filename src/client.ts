@@ -5,7 +5,7 @@ import type { RawBookingResponse, RawUpcomingResponse } from "./rawTypes.js";
 import type { SportyBetBooking, SportyBetFixture, SportyBetSelection } from "./types.js";
 import { resolveSport } from "./marketCatalogue.js";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class SportyBetError extends Error {
   constructor(
@@ -35,7 +35,7 @@ const MULTI_SPORT_LIST = ["football", "basketball", "tennis"];
 export class SportyBetClient {
   private lastRequestAt = 0;
   private inflight = 0;
-  private readonly cache = new Map();
+  private readonly cache = new Map<string, { at: number; fixtures: SportyBetFixture[] }>();
 
   constructor(private readonly cfg: AppConfig = loadConfig()) {}
 
@@ -67,10 +67,10 @@ export class SportyBetClient {
     this.inflight--;
   }
 
-  private async request(
+  private async request<T>(
     path: string,
     init: RequestInit & { retry?: boolean } = {},
-  ): Promise<any> {
+  ): Promise<T> {
     const { retry = true, ...rest } = init;
     const url = `${this.baseUrl}${path}`;
     const timeoutMs = this.cfg.timeoutMs;
@@ -121,7 +121,7 @@ export class SportyBetClient {
           }
           throw new SportyBetError("MALFORMED_RESPONSE", errMsg, "Try again later; the upstream API may be misbehaving.", true);
         }
-        return body;
+        return body as T;
       } catch (err) {
         const latencyMs = Date.now() - started;
         if (err instanceof SportyBetError) throw err;
@@ -235,7 +235,7 @@ export class SportyBetClient {
         timeline: String(timelineHours),
         _t: String(Date.now()),
       });
-      const raw: RawUpcomingResponse = await this.request(`/factsCenter/pcUpcomingEvents?${params.toString()}`);
+      const raw = await this.request<RawUpcomingResponse>(`/factsCenter/pcUpcomingEvents?${params.toString()}`);
       const biz = this.bizError(raw);
       if (biz) throw biz;
 
@@ -273,40 +273,43 @@ export class SportyBetClient {
     return null;
   }
 
-async createBooking(selections: SportyBetSelection[]): Promise {
-const payload = {
-selections: selections.map((s) => ({
-eventId: s.eventId,
-marketId: s.marketId,
-specifier: s.specifier ?? null,
-outcomeId: s.outcomeId,
-})),
-};
-const raw: RawBookingResponse = await this.request("/orders/share", {
-method: "POST",
-body: JSON.stringify(payload),
-retry: false,
-});
-const biz = this.bizError(raw);
-if (biz) throw biz;
-const booking = normalizeBooking(raw);
-if (!booking.shareCode) {
-throw new SportyBetError(
-"NO_BOOKING_CODE",
-"SportyBet share endpoint did not return a booking code.",
-"Refresh odds and rebuild the betslip.",
-);
-}
-return booking;
-}
-async getBookingStatus(bookingCode: string): Promise {
-const clean = encodeURIComponent(bookingCode.trim());
-const raw: RawBookingResponse = await this.request(/orders/share/${clean}, {
-method: "GET",
-retry: true,
-});
-const biz = this.bizError(raw);
-if (biz) throw biz;
-return normalizeBooking(raw);
-}
+  async createBooking(selections: SportyBetSelection[]): Promise<SportyBetBooking> {
+    const payload = {
+      selections: selections.map((s) => ({
+        eventId: s.eventId,
+        marketId: s.marketId,
+        specifier: s.specifier ?? null,
+        outcomeId: s.outcomeId,
+      })),
+    };
+
+    const raw = await this.request<RawBookingResponse>("/orders/share", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      retry: false,
+    });
+    const biz = this.bizError(raw);
+    if (biz) throw biz;
+
+    const booking = normalizeBooking(raw);
+    if (!booking.shareCode) {
+      throw new SportyBetError(
+        "NO_BOOKING_CODE",
+        "SportyBet share endpoint did not return a booking code.",
+        "Refresh odds and rebuild the betslip.",
+      );
+    }
+    return booking;
+  }
+
+  async getBookingStatus(bookingCode: string): Promise<SportyBetBooking> {
+    const clean = encodeURIComponent(bookingCode.trim());
+    const raw = await this.request<RawBookingResponse>(`/orders/share/${clean}`, {
+      method: "GET",
+      retry: true,
+    });
+    const biz = this.bizError(raw);
+    if (biz) throw biz;
+    return normalizeBooking(raw);
+  }
 }
