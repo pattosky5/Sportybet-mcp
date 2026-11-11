@@ -1,9 +1,76 @@
-/**
- * SportyBet market ID catalogue.
- * Market IDs and descriptions were confirmed against live SportyBet responses
- * (see README "API source"). Used to pick which market IDs to request from the
- * fixtures endpoint and to resolve display names when needed.
- */
+export interface SportConfig {
+  id: string;
+  name: string;
+  aliases: string[];
+  defaultMarketIds: string[];
+}
+
+export const SPORT_CATALOGUE: Record<string, SportConfig> = {
+  football: {
+    id: "sr:sport:1",
+    name: "Football",
+    aliases: ["football", "soccer", "sr:sport:1"],
+    defaultMarketIds: ["1", "18", "10", "29", "11", "26", "36", "14", "60100"],
+  },
+  basketball: {
+    id: "sr:sport:2",
+    name: "Basketball",
+    aliases: ["basketball", "nba", "euroleague", "ncaa", "sr:sport:2"],
+    defaultMarketIds: ["219", "186", "223", "225", "227", "228", "229", "60"],
+  },
+  tennis: {
+    id: "sr:sport:5",
+    name: "Tennis",
+    aliases: ["tennis", "atp", "wta", "itf", "challenger", "sr:sport:5"],
+    defaultMarketIds: ["186", "187", "188", "189", "190", "191", "202"],
+  },
+  ice_hockey: {
+    id: "sr:sport:4",
+    name: "Ice Hockey",
+    aliases: ["ice_hockey", "hockey", "nhl", "sr:sport:4"],
+    defaultMarketIds: ["1", "18", "10", "11", "14", "29"],
+  },
+  handball: {
+    id: "sr:sport:6",
+    name: "Handball",
+    aliases: ["handball", "sr:sport:6"],
+    defaultMarketIds: ["1", "18", "10", "14"],
+  },
+  table_tennis: {
+    id: "sr:sport:20",
+    name: "Table Tennis",
+    aliases: ["table_tennis", "ping_pong", "sr:sport:20"],
+    defaultMarketIds: ["186", "187", "189", "202"],
+  },
+  volleyball: {
+    id: "sr:sport:23",
+    name: "Volleyball",
+    aliases: ["volleyball", "sr:sport:23"],
+    defaultMarketIds: ["186", "187", "189", "202"],
+  },
+};
+
+export const ALL_SUPPORTED_SPORTS = Object.keys(SPORT_CATALOGUE);
+
+export function resolveSport(sportInput?: string): SportConfig {
+  if (!sportInput) return SPORT_CATALOGUE.football!;
+  const normalized = sportInput.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  for (const cfg of Object.values(SPORT_CATALOGUE)) {
+    if (cfg.aliases.includes(normalized) || cfg.id.toLowerCase() === normalized) {
+      return cfg;
+    }
+  }
+  if (normalized.startsWith("sr:sport:")) {
+    return {
+      id: normalized,
+      name: normalized,
+      aliases: [normalized],
+      defaultMarketIds: ["1", "186", "18", "10", "14"],
+    };
+  }
+  return SPORT_CATALOGUE.football!;
+}
+
 export const MARKET_CATALOGUE: ReadonlyArray<readonly [string, string]> = [
   ["1", "1X2"],
   ["60100", "1X2 - 2UP"],
@@ -18,70 +85,32 @@ export const MARKET_CATALOGUE: ReadonlyArray<readonly [string, string]> = [
   ["15", "Winning Margin"],
   ["16", "Asian Handicap -1.5"],
   ["18", "Over/Under"],
-  ["19", "South Africa Over/Under"],
-  ["20", "Ivory Coast Over/Under"],
-  ["21", "Exact Goals"],
-  ["23", "Home Team Goals"],
-  ["24", "Away Team Goals"],
-  ["25", "Goal Range"],
-  ["26", "Odd/Even"],
-  ["27", "Home Team Odd/Even"],
-  ["28", "Away Team Odd/Even"],
   ["29", "GG/NG"],
-  ["30", "Teams to Score"],
-  ["31", "Home Team Clean Sheet"],
-  ["32", "Away Team Clean Sheet"],
-  ["33", "Home Team to Win to Nil"],
-  ["34", "Away Team to Win to Nil"],
   ["35", "1X2 & GG/NG"],
   ["36", "Over/Under & GG/NG"],
   ["37", "1X2 & Over/Under 1.5"],
-  ["41", "Correct Score [0:0]"],
-  ["45", "Correct Score"],
-  ["46", "Half Time/Full Time Correct Score"],
-  ["47", "Half Time/Full Time"],
-  ["48", "Home Team to Win Both Halves"],
-  ["49", "Away Team to Win Both Halves"],
-  ["50", "Home Team to Win Either Half"],
-  ["51", "Away Team to Win Either Half"],
-  ["52", "Highest Scoring Half"],
-  ["55", "1st/2nd Half GG/NG"],
-  ["56", "Home Team to Score In Both Halves"],
-  ["57", "Away Team to Score In Both Halves"],
-  ["58", "Both Halves Over 1.5"],
-  ["59", "Both Halves Under 1.5"],
   ["60", "1st Half - 1X2"],
-  ["63", "1st Half - Double Chance"],
-  ["64", "1st Half - Draw No Bet"],
-  ["65", "1st Half - Handicap"],
   ["68", "1st Half - Over/Under"],
-  ["71", "1st Half - Exact Goals"],
-  ["74", "1st Half - Odd/Even"],
-  ["75", "1st Half - GG/NG"],
-  ["76", "1st Half - Home Team Clean Sheet"],
-  ["77", "1st Half - Away Team Clean Sheet"],
-  ["78", "1st Half - 1X2 & GG/NG"],
-  ["81", "1st Half - Correct Score"],
   ["83", "2nd Half - 1X2"],
-  ["85", "2nd Half - Double Chance"],
-  ["86", "2nd Half - Draw No Bet"],
-  ["87", "2nd Half - Handicap"],
   ["90", "2nd Half - Over/Under"],
-  ["93", "2nd Half - Exact Goals"],
-  ["95", "2nd Half - GG/NG"],
-  ["98", "2nd Half - Correct Score"],
-  ["162", "Corners - 1X2"],
-  ["163", "1st Corner"],
-  ["164", "Last Corner"],
-  ["165", "Corner Handicap"],
-  ["166", "Corners - Over/Under"],
-  ["172", "Odd/Even Corners"],
-  ["184", "1st Goal & 1X2"],
+  ["186", "Winner (2-Way)"],
+  ["187", "Game / Point Handicap"],
+  ["188", "1st Set Winner"],
+  ["189", "Total Games / Points"],
+  ["190", "Player 1 Total Games"],
+  ["191", "Player 2 Total Games"],
+  ["202", "Set Handicap"],
+  ["219", "Winner (Incl. Overtime)"],
+  ["223", "Point Spread (Incl. OT)"],
+  ["225", "Total Points (Incl. OT)"],
+  ["227", "Home Team Total Points"],
+  ["228", "Away Team Total Points"],
+  ["229", "Odd/Even (Incl. OT)"],
 ];
 
 export function marketNameForId(id: string): string | undefined {
-  return MARKET_CATALOGUE.find(([marketId]) => marketId === id)?.[1];
+  const found = MARKET_CATALOGUE.find(([marketId]) => marketId === id);
+  return found ? found[1] : undefined;
 }
 
-/** Default market set requested from the fixtures endpoint (kept modest to avoid overload). */
-export const DEFAULT_MARKET_IDS = ["1", "18", "10", "29", "11", "26", "36", "14", "60100"];
+export const DEFAULT_MARKET_IDS = SPORT_CATALOGUE.football!.defaultMarketIds;
