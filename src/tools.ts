@@ -1,13 +1,9 @@
-/**
- * MCP tool handlers. Each returns a CallToolResult-shaped object.
- * All responses are normalized JSON — never raw SportyBet payloads.
- */
 import type { SportyBetClient } from "./client.js";
 import type { SportyBetFixture, SportyBetSelection } from "./types.js";
 import { calcCombinedOdds, OddsError } from "./odds.js";
 import { validateSelections } from "./validation.js";
 import { logger } from "./logger.js";
-import { DEFAULT_MARKET_IDS } from "./marketCatalogue.js";
+import { resolveSport } from "./marketCatalogue.js";
 
 export interface ToolResult {
   content: { type: "text"; text: string }[];
@@ -35,7 +31,6 @@ function clampLimit(limit: number | undefined, fallback = 50): number {
   return Math.min(Math.max(n, 1), MAX_LIMIT);
 }
 
-/** Day bounds in the configured timezone offset (default West Africa Time, UTC+1). */
 function dayBounds(date: string, tzOffsetMinutes: number): { start: number; end: number } | null {
   if (!DATE_RE.test(date)) return null;
   const [y, m, d] = date.split("-").map(Number);
@@ -70,12 +65,16 @@ function fixtureProjection(f: SportyBetFixture) {
 
 export async function sportybetGetFixtures(
   client: SportyBetClient,
-  args: { date?: string; league?: string; limit?: number },
+  args: { sport?: string; date?: string; league?: string; limit?: number },
   cfgTzOffsetMinutes: number,
 ): Promise<ToolResult> {
   const limit = clampLimit(args.limit);
   const timeline = timelineForDate(args.date, cfgTzOffsetMinutes);
-  const fixtures = await client.getFixtures({ timelineHours: timeline, maxPages: Math.ceil(limit / 100) + 1 });
+  const fixtures = await client.getFixtures({
+    sport: args.sport,
+    timelineHours: timeline,
+    maxPages: Math.ceil(limit / 100) + 1,
+  });
 
   let filtered = fixtures;
   const bounds = args.date ? dayBounds(args.date, cfgTzOffsetMinutes) : null;
@@ -92,25 +91,27 @@ export async function sportybetGetFixtures(
   const result = {
     success: true,
     fetchedAt: new Date().toISOString(),
+    sport: args.sport ?? "football",
     date: args.date ?? null,
     league: args.league ?? null,
     count: Math.min(filtered.length, limit),
     fixtures: filtered.slice(0, limit).map(fixtureProjection),
   };
-  logger.info({ tool: "sportybet_get_fixtures", success: true, count: result.count });
+  logger.info({ tool: "sportybet_get_fixtures", success: true, sport: result.sport, count: result.count });
   return ok(result);
 }
 
 export async function sportybetGetMarkets(
   client: SportyBetClient,
-  args: { eventId: string },
+  args: { eventId: string; sport?: string },
 ): Promise<ToolResult> {
-  const fixture = await client.findEvent(args.eventId, DEFAULT_MARKET_IDS);
+  const marketIds = args.sport ? resolveSport(args.sport).defaultMarketIds : undefined;
+  const fixture = await client.findEvent(args.eventId, marketIds, args.sport);
   if (!fixture) {
     return fail(
       "EVENT_NOT_FOUND",
       `Event ${args.eventId} was not found in SportyBet's upcoming list.`,
-      "Refresh the fixtures; the event may have started or been removed.",
+      "Refresh the fixtures or specify the sport parameter; the event may have started or been removed.",
     );
   }
   const result = {
@@ -140,11 +141,11 @@ export async function sportybetGetMarkets(
 
 export async function sportybetGetOdds(
   client: SportyBetClient,
-  args: { eventIds: string[] },
+  args: { eventIds: string[]; sport?: string },
 ): Promise<ToolResult> {
   const ids = [...new Set(args.eventIds.slice(0, 50))];
   if (!ids.length) return fail("NO_EVENT_IDS", "Provide at least one eventId.", "Call sportybet_get_fixtures first.");
-  const fixtures = await client.getFixtures();
+  const fixtures = await client.getFixtures({ sport: args.sport ?? "all" });
   const byId = new Map(fixtures.map((f) => [f.eventId, f]));
   const found = ids.filter((id) => byId.has(id)).map((id) => byId.get(id)!);
   const missing = ids.filter((id) => !byId.has(id));
@@ -184,14 +185,14 @@ export async function sportybetGetOdds(
 
 export async function sportybetSearchFixtures(
   client: SportyBetClient,
-  args: { query: string; date?: string; limit?: number },
+  args: { query: string; sport?: string; date?: string; limit?: number },
   cfgTzOffsetMinutes: number,
 ): Promise<ToolResult> {
   const limit = clampLimit(args.limit);
   const query = args.query.trim().toLowerCase();
-  if (!query) return fail("EMPTY_QUERY", "Provide a search query.", "Search by team name, league, or country.");
+  if (!query) return fail("EMPTY_QUERY", "Provide a search query.", "Search by team name, player name, league, or country.");
   const timeline = timelineForDate(args.date, cfgTzOffsetMinutes);
-  const fixtures = await client.getFixtures({ timelineHours: timeline });
+  const fixtures = await client.getFixtures({ sport: args.sport ?? "all", timelineHours: timeline });
 
   const bounds = args.date ? dayBounds(args.date, cfgTzOffsetMinutes) : null;
   const matches = fixtures
@@ -206,6 +207,7 @@ export async function sportybetSearchFixtures(
     success: true,
     fetchedAt: new Date().toISOString(),
     query: args.query,
+    sport: args.sport ?? "all",
     date: args.date ?? null,
     count: matches.length,
     fixtures: matches.map(fixtureProjection),
@@ -236,90 +238,35 @@ export async function sportybetBookBet(
   client: SportyBetClient,
   args: { selections: SportyBetSelection[] },
 ): Promise<ToolResult> {
-  const selections = args.selections;
-  if (!selections.length) {
-    return fail("EMPTY_SELECTION", "No selections provided.", "Provide at least one selection with eventId, marketId and outcomeId.");
-  }
-  if (selections.length > 20) {
-    return fail("TOO_MANY_SELECTIONS", "Maximum 20 selections per betslip.", "Reduce the number of selections.");
+  if (!args.selections.length) {
+    return fail("EMPTY_SELECTIONS", "Provide at least one selection to book.", "Fetch fixtures and markets first.");
   }
 
-  const marketIds = [...new Set([...selections.map((s) => s.marketId), ...DEFAULT_MARKET_IDS])];
-  const fixtures = await client.getFixtures({ marketIds, maxPages: 20 });
-
-  const validation = validateSelections(selections, fixtures);
+  const liveFixtures = await client.getFixtures({ sport: "all" });
+  const validation = validateSelections(args.selections, liveFixtures);
   if (!validation.valid) {
-    const detail = validation.results
-      .map((r, i) => ({
-        selection: i + 1,
-        eventId: r.selection.eventId,
-        problems: r.errors,
-      }))
-      .filter((d) => d.problems.length);
-    logger.warn({ tool: "sportybet_book_bet", success: false, errorCode: "VALIDATION_FAILED", problems: validation.errors.length });
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              success: false,
-              error: {
-                code: "VALIDATION_FAILED",
-                message: `${validation.errors.length} validation problem(s) found. Booking was NOT created.`,
-                action: "Refresh the odds and rebuild the selection.",
-                details: detail,
-              },
-            },
-            null,
-            2,
-          ),
-        },
-      ],
-      isError: true,
-    };
+    return fail(
+      "VALIDATION_FAILED",
+      `Selection validation failed: ${validation.errors.join("; ")}`,
+      "Refresh odds and rebuild selections before booking.",
+    );
   }
 
-  const resolved = validation.results.map((r) => ({
-    selection: r.selection,
-    event: r.event!,
-    market: r.market!,
-    outcome: r.outcome!,
-  }));
-
-  const booking = await client.createBooking(selections);
-
-  const liveOdds = booking.legs.map((l) => l.outcome.odds).filter((o) => Number.isFinite(o) && o > 0);
-  const combined = liveOdds.length === booking.legs.length ? calcCombinedOdds(liveOdds) : null;
-
-  const priceMoved = validation.warnings
-    .map((w) => w)
-    .filter((w) => w.startsWith("Odds for"));
-  const dropped = (booking.unavailableOutcomes ?? []).length;
+  const booking = await client.createBooking(args.selections);
+  const legOdds = booking.outcomes.map((o) => o.odds).filter((n) => Number.isFinite(n) && n > 0);
+  const combinedOdds = legOdds.length ? calcCombinedOdds(legOdds) : null;
 
   const result = {
     success: true,
     bookingCode: booking.shareCode,
     shareURL: booking.shareURL,
-    selectionCount: booking.legs.length,
-    combinedOdds: combined,
-    expiresAt: booking.expiresAt,
-    betType: booking.betType ?? "Multiple",
-    message: "Betslip prepared. No wager was placed.",
-    warnings: [...validation.warnings, ...(dropped ? [`${dropped} selection(s) were unavailable and excluded from the code.`] : [])],
-    legs: booking.legs.map((l) => ({
-      eventId: l.eventId,
-      event: `${l.homeTeam} vs ${l.awayTeam}`,
-      startTime: l.startTime,
-      market: l.market.marketName,
-      marketId: l.market.marketId,
-      specifier: l.market.specifier,
-      outcome: l.outcome.outcomeName,
-      outcomeId: l.outcome.outcomeId,
-      odds: l.outcome.odds,
-    })),
+    expiresAt: booking.deadline,
+    combinedOdds,
+    legs: booking.outcomes,
+    unavailableOutcomes: booking.unavailableOutcomes,
+    note: "Non-staking booking code created. Paste this code into SportyBet Nigeria to review and stake manually.",
   };
-  logger.info({ tool: "sportybet_book_bet", success: true, bookingCode: booking.shareCode, legs: booking.legs.length });
+  logger.info({ tool: "sportybet_book_bet", success: true, bookingCode: booking.shareCode });
   return ok(result);
 }
 
@@ -327,26 +274,19 @@ export async function sportybetGetBookingStatus(
   client: SportyBetClient,
   args: { bookingCode: string },
 ): Promise<ToolResult> {
-  const booking = await client.getBooking(args.bookingCode);
-  const result = {
-    success: true,
-    bookingCode: booking.shareCode,
-    shareURL: booking.shareURL,
-    expiresAt: booking.expiresAt,
-    betType: booking.betType ?? "Multiple",
-    selectionCount: booking.legs.length,
-    status: "prepared",
-    note: "This booking code was prepared but never staked. Checking it does not place or modify any wager.",
-    legs: booking.legs.map((l) => ({
-      eventId: l.eventId,
-      event: `${l.homeTeam} vs ${l.awayTeam}`,
-      startTime: l.startTime,
-      matchStatus: l.matchStatus,
-      market: l.market.marketName,
-      outcome: l.outcome.outcomeName,
-      odds: l.outcome.odds,
-    })),
-  };
-  logger.info({ tool: "sportybet_get_booking_status", success: true, bookingCode: args.bookingCode });
-  return ok(result);
+  const code = args.bookingCode.trim();
+  if (!code) {
+    return fail("INVALID_BOOKING_CODE", "Provide a non-empty booking code.", "Check the booking code and retry.");
+}
+const booking = await client.getBookingStatus(code);
+const result = {
+success: true,
+bookingCode: booking.shareCode,
+shareURL: booking.shareURL,
+expiresAt: booking.deadline,
+legs: booking.outcomes,
+unavailableOutcomes: booking.unavailableOutcomes,
+};
+logger.info({ tool: "sportybet_get_booking_status", success: true, bookingCode: code });
+return ok(result);
 }
