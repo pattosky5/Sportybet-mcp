@@ -253,16 +253,16 @@ export async function sportybetBookBet(
   }
 
   const booking = await client.createBooking(args.selections);
-  const legOdds = booking.outcomes.map((o) => o.odds).filter((n) => Number.isFinite(n) && n > 0);
+  const legOdds = booking.legs.map((o) => o.odds).filter((n) => Number.isFinite(n) && n > 0);
   const combinedOdds = legOdds.length ? calcCombinedOdds(legOdds) : null;
 
   const result = {
     success: true,
     bookingCode: booking.shareCode,
     shareURL: booking.shareURL,
-    expiresAt: booking.deadline,
+    expiresAt: booking.deadlineMs ? new Date(booking.deadlineMs).toISOString() : null,
     combinedOdds,
-    legs: booking.outcomes,
+    legs: booking.legs,
     unavailableOutcomes: booking.unavailableOutcomes,
     note: "Non-staking booking code created. Paste this code into SportyBet Nigeria to review and stake manually.",
   };
@@ -277,16 +277,17 @@ export async function sportybetGetBookingStatus(
   const code = args.bookingCode.trim();
   if (!code) {
     return fail("INVALID_BOOKING_CODE", "Provide a non-empty booking code.", "Check the booking code and retry.");
-}
-const booking = await client.getBookingStatus(code);
-const result = {
-success: true,
-bookingCode: booking.shareCode,
-shareURL: booking.shareURL,
-expiresAt: booking.deadline,
-legs: booking.outcomes,
-unavailableOutcomes: booking.unavailableOutcomes,
-};
-logger.info({ tool: "sportybet_get_booking_status", success: true, bookingCode: code });
-return ok(result);
-}
+  }
+  const booking = await client.getBookingStatus(code);
+  const result = {
+    success: true,
+    bookingCode: booking.shareCode,
+    shareURL: booking.shareURL,
+    expiresAt: booking.deadlineMs ? new Date(booking.deadlineMs).toISOString() : null,
+    legs: booking.legs,
+    unavailableOutcomes: booking.unavailableOutcomes,
+  };
+  logger.info({ tool: "sportybet_get_booking_status", success: true, bookingCode: code });
+  return ok(result);
+            }
+    
