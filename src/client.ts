@@ -1,25 +1,9 @@
-/**
- * SportyBetClient — HTTP layer for the SportyBet web API.
- *
- * Source: SportyBet's own public web API (the same endpoints the sportybet.com
- * website and mobile apps use). NOT an official developer API — undocumented
- * and subject to change. See README "API source".
- *
- * Safety:
- *  - Only reads fixtures/markets/odds.
- *  - Only creates shareable booking codes via POST /orders/share, which is an
- *    anonymous, non-staking operation. This class has NO code path that
- *    places, submits, or stakes a wager.
- *  - Polite rate limiting (min interval + concurrency cap), exponential
- *    backoff for GET retries, request timeouts, short TTL caching.
- *  - Never auto-retries the booking POST.
- */
 import { loadConfig, type AppConfig } from "./config.js";
 import { logger } from "./logger.js";
 import { flattenFixtures, normalizeBooking } from "./normalizers.js";
 import type { RawBookingResponse, RawUpcomingResponse } from "./rawTypes.js";
 import type { SportyBetBooking, SportyBetFixture, SportyBetSelection } from "./types.js";
-import { DEFAULT_MARKET_IDS } from "./marketCatalogue.js";
+import { resolveSport } from "./marketCatalogue.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -36,16 +20,17 @@ export class SportyBetError extends Error {
 }
 
 export interface FixturesRequest {
+  sport?: string;
   marketIds?: string[];
   timelineHours?: number;
   pageSize?: number;
   maxPages?: number;
 }
 
-const SPORT_ID = "sr:sport:1";
 const MAX_PAGE_SIZE = 100;
 const MAX_PAGES = 5;
 const DEFAULT_TIMELINE_HOURS = 720;
+const MULTI_SPORT_LIST = ["football", "basketball", "tennis"];
 
 export class SportyBetClient {
   private lastRequestAt = 0;
@@ -59,15 +44,13 @@ export class SportyBetClient {
   }
 
   private headers(): Record<string, string> {
-    const h: Record<string, string> = {
+    return {
       Accept: "application/json",
       "Content-Type": "application/json",
       "Current-Country": this.cfg.region.toUpperCase(),
     };
-    return h;
   }
 
-  /** Token-bucket style pacing: min interval between requests + concurrency cap. */
   private async acquireSlot(): Promise<void> {
     for (;;) {
       const wait = this.lastRequestAt + this.cfg.minRequestIntervalMs - Date.now();
@@ -215,120 +198,75 @@ export class SportyBetClient {
       const bizCode = Number(b.bizCode);
       if (bizCode && bizCode !== 10000) {
         const msg = typeof b.message === "string" ? b.message : `bizCode ${bizCode}`;
-        return new SportyBetError("UPSTREAM", `SportyBet rejected the request: ${msg}`, "The request may be malformed or the fixture/market may no longer exist.");
+        return new SportyBetError("UPSTREAM", `SportyBet rejected request: ${msg}`, "Verify inputs and try again.");
       }
     }
     return null;
   }
 
-  private cacheKey(marketIds: string[], page: number): string {
-    return `${marketIds.join(",")}:${page}`;
-  }
-
-  private cacheGet(key: string): SportyBetFixture[] | null {
-    const hit = this.cache.get(key);
-    if (!hit) return null;
-    if (Date.now() - hit.at > this.cfg.cacheTtlMs) {
-      this.cache.delete(key);
-      return null;
-    }
-    return hit.fixtures;
-  }
-
-  private cacheSet(key: string, fixtures: SportyBetFixture[]): void {
-    this.cache.set(key, { at: Date.now(), fixtures });
-  }
-
-  /**
-   * Fetch upcoming football fixtures, walking pages until the limit.
-   * timelineHours controls how far ahead the catalogue reaches (hours).
-   */
   async getFixtures(req: FixturesRequest = {}): Promise<SportyBetFixture[]> {
-    const marketIds = req.marketIds?.length ? [...new Set(req.marketIds)] : DEFAULT_MARKET_IDS;
-    const timelineHours = Math.max(12, Math.min(req.timelineHours ?? DEFAULT_TIMELINE_HOURS, 720));
-    const pageSize = Math.min(Math.max(req.pageSize ?? MAX_PAGE_SIZE, 1), MAX_PAGE_SIZE);
-    const maxPages = Math.min(req.maxPages ?? MAX_PAGES, 20);
-    const all: SportyBetFixture[] = [];
-
-    for (let page = 1; page <= maxPages; page++) {
-      const key = this.cacheKey(marketIds, page);
-      let fixtures = this.cacheGet(key);
-      if (!fixtures) {
-        const params = new URLSearchParams({
-          sportId: SPORT_ID,
-          marketId: marketIds.join(","),
-          pageSize: String(pageSize),
-          pageNum: String(page),
-          todayGames: "false",
-          timeline: String(timelineHours),
-          _t: String(Date.now()),
-        });
-        const raw = await this.request<RawUpcomingResponse>(
-          `/factsCenter/pcUpcomingEvents?${params.toString()}`,
-        );
-        const bizError = this.bizError(raw);
-        if (bizError) throw bizError;
-        fixtures = flattenFixtures(raw.data?.tournaments);
-        this.cacheSet(key, fixtures);
-      }
-      all.push(...fixtures);
-      if (fixtures.length === 0 || fixtures.length < pageSize) break;
-    }
-    return all;
-  }
-
-  /** Find a specific event by id. Returns null when the event is not in the upcoming catalogue. */
-  async findEvent(eventId: string, marketIds?: string[]): Promise<SportyBetFixture | null> {
-    const all = await this.getFixtures({ marketIds });
-    return all.find((f) => f.eventId === eventId) ?? null;
-  }
-
-  /**
-   * Create a shareable SportyBet booking code for the given selections.
-   * This is an anonymous, NON-STAKING operation: it returns a share code but
-   * does not place, submit, or stake any wager. POST is never auto-retried.
-   */
-  async createBooking(selections: SportyBetSelection[]): Promise<SportyBetBooking> {
-    if (!selections.length) {
-      throw new SportyBetError("EMPTY_SELECTION", "No selections provided.", "Provide at least one selection.");
-    }
-    const payload = {
-      selections: selections.map((s) => ({
-        eventId: s.eventId,
-        marketId: s.marketId,
-        specifier: s.specifier ?? null,
-        outcomeId: s.outcomeId,
-      })),
-    };
-    const raw = await this.request<RawBookingResponse>("/orders/share", {
-      method: "POST",
-      body: JSON.stringify(payload),
-      retry: false,
-    });
-    const bizError = this.bizError(raw);
-    if (bizError) throw bizError;
-    if (!raw.data?.shareCode) {
-      throw new SportyBetError(
-        "NO_BOOKING_CODE",
-        "SportyBet did not return a booking code.",
-        "The selections may have changed (odds moved or market closed). Refresh and rebuild.",
+    if (req.sport?.trim().toLowerCase() === "all") {
+      const results = await Promise.all(
+        MULTI_SPORT_LIST.map((s) => this.getFixtures({ ...req, sport: s })),
       );
+      return results.flat();
     }
-    return normalizeBooking(raw.data);
+
+    const sportCfg = resolveSport(req.sport);
+    const marketIds = req.marketIds?.length ? req.marketIds : sportCfg.defaultMarketIds;
+    const timelineHours = Math.min(Math.max(req.timelineHours ?? DEFAULT_TIMELINE_HOURS, 1), 720);
+    const pageSize = Math.min(Math.max(req.pageSize ?? MAX_PAGE_SIZE, 1), MAX_PAGE_SIZE);
+    const maxPages = Math.min(Math.max(req.maxPages ?? MAX_PAGES, 1), 10);
+
+    const cacheKey = `${sportCfg.id}:${marketIds.join(",")}:${timelineHours}:${maxPages}`;
+    const hit = this.cache.get(cacheKey);
+    if (hit && Date.now() - hit.at < this.cfg.cacheTtlMs) {
+      return hit.fixtures;
+    }
+
+    const collected: SportyBetFixture[] = [];
+    for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+      const params = new URLSearchParams({
+        sportId: sportCfg.id,
+        marketId: marketIds.join(","),
+        pageSize: String(pageSize),
+        pageNum: String(pageNum),
+        todayGames: "false",
+        timeline: String(timelineHours),
+        _t: String(Date.now()),
+      });
+      const raw = await this.request<RawUpcomingResponse>(`/factsCenter/pcUpcomingEvents?${params.toString()}`);
+      const biz = this.bizError(raw);
+      if (biz) throw biz;
+
+      const batch = flattenFixtures(raw);
+      collected.push(...batch);
+
+      const total = Number(raw?.data?.totalNum ?? 0);
+      if (batch.length < pageSize || (total > 0 && collected.length >= total)) {
+        break;
+      }
+    }
+
+    this.cache.set(cacheKey, { at: Date.now(), fixtures: collected });
+    return collected;
   }
 
-  /** Read an existing booking code. Read-only — never modifies a wager. */
-  async getBooking(code: string): Promise<SportyBetBooking> {
-    const clean = code.trim().toUpperCase();
-    if (!/^[A-Z0-9]{4,12}$/.test(clean)) {
-      throw new SportyBetError("INVALID_BOOKING_CODE", `"${code}" does not look like a SportyBet booking code.`, "Booking codes are 4-12 uppercase letters/digits.");
+  async findEvent(
+    eventId: string,
+    marketIds?: string[],
+    sport?: string,
+  ): Promise<SportyBetFixture | null> {
+    const sportsToSearch = sport
+      ? [sport]
+      : ["football", "basketball", "tennis", "ice_hockey", "table_tennis", "volleyball", "handball"];
+
+    for (const s of sportsToSearch) {
+      const sportCfg = resolveSport(s);
+      const fixtures = await this.getFixtures({
+        sport: s,
+        marketIds: marketIds?.length ? marketIds : sportCfg.defaultMarketIds,
+      });
+      const match = fixtures.find((f) => f.eventId === eventId);
+      if (match) return match;
     }
-    const raw = await this.request<RawBookingResponse>(`/orders/share/${encodeURIComponent(clean)}`);
-    const bizError = this.bizError(raw);
-    if (bizError) throw bizError;
-    if (!raw.data?.shareCode) {
-      throw new SportyBetError("BOOKING_NOT_FOUND", `Booking code ${clean} was not found or has expired.`, "Re-create the booking code or check the code spelling.");
-    }
-    return normalizeBooking(raw.data);
-  }
-}
